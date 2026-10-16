@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/traefik/traefik/v3/pkg/config/dynamic"
+	"github.com/traefik/traefik/v3/pkg/tls"
 	"google.golang.org/grpc/codes"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -464,6 +465,11 @@ func (p *Provider) loadGRPCServers(gatewayName, gatewayNamespace, namespace stri
 				}
 			}
 		}
+	}
+
+	// The Gateway backend TLS configuration does not decide which backends get TLS, a BackendTLSPolicy does.
+	if serversTransport != nil && listener.BackendClientCertificate != nil {
+		serversTransport.Certificates = tls.Certificates{*listener.BackendClientCertificate}
 	}
 
 	// If a ServersTransport is set, it means a BackendTLSPolicy matched the service port, and we can safely assume the protocol is HTTPS.

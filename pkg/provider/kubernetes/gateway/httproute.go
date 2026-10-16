@@ -606,6 +606,11 @@ func (p *Provider) loadHTTPServers(gatewayName, gatewayNamespace, namespace stri
 		}
 	}
 
+	// The Gateway backend TLS configuration does not decide which backends get TLS, a BackendTLSPolicy does.
+	if serversTransport != nil && listener.BackendClientCertificate != nil {
+		serversTransport.Certificates = tls.Certificates{*listener.BackendClientCertificate}
+	}
+
 	lb := &dynamic.ServersLoadBalancer{}
 	lb.SetDefaults()
 

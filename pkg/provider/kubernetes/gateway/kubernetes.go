@@ -27,6 +27,7 @@ import (
 	"github.com/traefik/traefik/v3/pkg/tls"
 	"github.com/traefik/traefik/v3/pkg/types"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	ktypes "k8s.io/apimachinery/pkg/types"
@@ -167,11 +168,17 @@ type gatewayListener struct {
 
 	// ListenerSet is the ListenerSet declaring this listener, nil when the Gateway declares it itself.
 	ListenerSet *gatev1.ListenerSet
+
+	// BackendClientCertificate is the client certificate the Gateway presents to the backends it originates TLS to.
+	BackendClientCertificate *tls.Certificate
 }
 
 type gatewayWithListeners struct {
 	gateway   *gatev1.Gateway
 	listeners []gatewayListener
+
+	// backendClientCertificateCondition is set when the Gateway backend client certificate cannot be resolved.
+	backendClientCertificateCondition *metav1.Condition
 }
 
 // RegisterFilterFuncs registers an allowed Group, Kind, and builder for the Filter ExtensionRef objects.
@@ -453,9 +460,16 @@ func (p *Provider) loadConfigurationFromGateways(ctx context.Context) (*dynamic.
 
 		listeners = append(listeners, p.loadListenerSetListeners(logger.WithContext(ctx), gateway, listenerSets, claims, conf, statusReport)...)
 
+		// The backend client certificate is a Gateway setting, which also applies to the routes attached to its ListenerSets.
+		backendClientCert, backendClientCertCondition := p.loadBackendClientCertificate(gateway)
+		for i := range listeners {
+			listeners[i].BackendClientCertificate = backendClientCert
+		}
+
 		gatewaysWithListeners = append(gatewaysWithListeners, gatewayWithListeners{
-			gateway:   gateway,
-			listeners: listeners,
+			gateway:                           gateway,
+			listeners:                         listeners,
+			backendClientCertificateCondition: backendClientCertCondition,
 		})
 	}
 
@@ -489,7 +503,7 @@ func (p *Provider) loadConfigurationFromGateways(ctx context.Context) (*dynamic.
 			return len(listener.Status.Conditions) == 0
 		})
 
-		gatewayStatus, errConditions := p.makeGatewayStatus(gwl.gateway, gwl.listeners, addresses, accepted)
+		gatewayStatus, errConditions := p.makeGatewayStatus(gwl.gateway, gwl.listeners, gwl.backendClientCertificateCondition, addresses, accepted)
 		if len(errConditions) > 0 {
 			messages := map[string]struct{}{}
 			for _, condition := range errConditions {
@@ -1007,7 +1021,7 @@ func (p *Provider) loadListenerSetListeners(ctx context.Context, gateway *gatev1
 	return listeners
 }
 
-func (p *Provider) makeGatewayStatus(gateway *gatev1.Gateway, listeners []gatewayListener, addresses []gatev1.GatewayStatusAddress, accepted bool) (gatev1.GatewayStatus, []metav1.Condition) {
+func (p *Provider) makeGatewayStatus(gateway *gatev1.Gateway, listeners []gatewayListener, backendClientCertCondition *metav1.Condition, addresses []gatev1.GatewayStatusAddress, accepted bool) (gatev1.GatewayStatus, []metav1.Condition) {
 	gatewayStatus := gatev1.GatewayStatus{Addresses: addresses}
 
 	var errorConditions []metav1.Condition
@@ -1053,6 +1067,9 @@ func (p *Provider) makeGatewayStatus(gateway *gatev1.Gateway, listeners []gatewa
 		errorConditions = append(errorConditions, listener.Status.Conditions...)
 		gatewayStatus.Listeners = append(gatewayStatus.Listeners, *listener.Status)
 	}
+
+	// The ResolvedRefs condition does not impact the Accepted and Programmed ones, and is reported in any case.
+	gatewayStatus.Conditions = append(gatewayStatus.Conditions, makeGatewayResolvedRefsCondition(gateway, listeners, backendClientCertCondition))
 
 	// Traefik supports no infrastructure parameters, and the specification requires
 	// a parametersRef that cannot be resolved to be reported instead of ignored.
@@ -1126,6 +1143,37 @@ func (p *Provider) makeGatewayStatus(gateway *gatev1.Gateway, listeners []gatewa
 	)
 
 	return gatewayStatus, nil
+}
+
+// makeGatewayResolvedRefsCondition reports the Gateway references which are not part of a listener,
+// and summarizes the ResolvedRefs condition of the listeners the Gateway declares itself.
+func makeGatewayResolvedRefsCondition(gateway *gatev1.Gateway, listeners []gatewayListener, backendClientCertCondition *metav1.Condition) metav1.Condition {
+	if backendClientCertCondition != nil {
+		return *backendClientCertCondition
+	}
+
+	unresolvedListeners := slices.ContainsFunc(listeners, func(listener gatewayListener) bool {
+		return listener.ListenerSet == nil && meta.IsStatusConditionFalse(listener.Status.Conditions, string(gatev1.ListenerConditionResolvedRefs))
+	})
+	if unresolvedListeners {
+		return metav1.Condition{
+			Type:               string(gatev1.GatewayConditionResolvedRefs),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatev1.GatewayReasonListenersNotResolved),
+			Message:            "Some Listeners have unresolved references",
+		}
+	}
+
+	return metav1.Condition{
+		Type:               string(gatev1.GatewayConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gateway.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatev1.GatewayReasonResolvedRefs),
+		Message:            conditionNoErrorMessage,
+	}
 }
 
 func (p *Provider) gatewayAddresses() ([]gatev1.GatewayStatusAddress, error) {
@@ -1235,6 +1283,54 @@ func (p *Provider) getTLSCert(secretName gatev1.ObjectName, namespace string) (*
 	}
 
 	return certAndStore, nil
+}
+
+// loadBackendClientCertificate loads the client certificate the Gateway presents to the backends it originates TLS to.
+// It returns a ResolvedRefs condition for the Gateway when the certificate reference cannot be resolved.
+func (p *Provider) loadBackendClientCertificate(gateway *gatev1.Gateway) (*tls.Certificate, *metav1.Condition) {
+	if gateway.Spec.TLS == nil || gateway.Spec.TLS.Backend == nil || gateway.Spec.TLS.Backend.ClientCertificateRef == nil {
+		return nil, nil
+	}
+
+	certRef := gateway.Spec.TLS.Backend.ClientCertificateRef
+	certNamespace := string(ptr.Deref(certRef.Namespace, gatev1.Namespace(gateway.Namespace)))
+
+	group := ptr.Deref(certRef.Group, "")
+	if kind := ptr.Deref(certRef.Kind, kindSecret); kind != kindSecret || (group != "" && group != groupCore) {
+		return nil, &metav1.Condition{
+			Type:               string(gatev1.GatewayConditionResolvedRefs),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatev1.GatewayReasonInvalidClientCertificateRef),
+			Message:            fmt.Sprintf("Unsupported ClientCertificateRef %s/%s: only core Secrets are supported", group, kind),
+		}
+	}
+
+	if err := p.isReferenceGranted(kindGateway, gateway.Namespace, groupCore, kindSecret, string(certRef.Name), certNamespace); err != nil {
+		return nil, &metav1.Condition{
+			Type:               string(gatev1.GatewayConditionResolvedRefs),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatev1.GatewayReasonRefNotPermitted),
+			Message:            fmt.Sprintf("Cannot reference ClientCertificateRef %s/%s: %s", certNamespace, certRef.Name, err),
+		}
+	}
+
+	certAndStores, err := p.getTLSCert(certRef.Name, certNamespace)
+	if err != nil {
+		return nil, &metav1.Condition{
+			Type:               string(gatev1.GatewayConditionResolvedRefs),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: gateway.Generation,
+			LastTransitionTime: metav1.Now(),
+			Reason:             string(gatev1.GatewayReasonInvalidClientCertificateRef),
+			Message:            fmt.Sprintf("Cannot load ClientCertificateRef %s/%s: %s", certNamespace, certRef.Name, err),
+		}
+	}
+
+	return &certAndStores.Certificate, nil
 }
 
 func (p *Provider) allowedNamespaces(gatewayNamespace string, routeNamespaces *gatev1.RouteNamespaces) ([]string, error) {

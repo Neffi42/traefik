@@ -454,6 +454,11 @@ func (p *Provider) loadTLSServers(gatewayName, gatewayNamespace, namespace strin
 		}
 	}
 
+	// The Gateway backend TLS configuration does not decide which backends get TLS, a BackendTLSPolicy does.
+	if serversTransport != nil && listener.BackendClientCertificate != nil {
+		serversTransport.TLS.Certificates = tls.Certificates{*listener.BackendClientCertificate}
+	}
+
 	if svcPort.Protocol != corev1.ProtocolTCP {
 		return nil, nil, &metav1.Condition{
 			Type:               string(gatev1.RouteConditionResolvedRefs),

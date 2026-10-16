@@ -157,6 +157,37 @@ Traefik supports [ListenerSet](https://gateway-api.sigs.k8s.io/geps/gep-1713/) r
     Because a `ListenerSet` may reference a `Secret` in its own namespace without a `ReferenceGrant`, any namespace admitted through `allowedListeners` can introduce certificates that compete in SNI selection on all TLS EntryPoints.
     Treat `allowedListeners` as a trust boundary, and only allow ListenerSets from namespaces you trust with TLS termination for the hostnames served by this Gateway.
 
+### Backend Client Certificate
+
+Traefik supports the `Gateway` [backend TLS configuration](https://gateway-api.sigs.k8s.io/reference/api-spec/main/spec/#gatewaybackendtls),
+which defines the client certificate Traefik presents to the backends requiring mutual TLS.
+
+The certificate is only presented to the backends Traefik connects to with TLS, that is, the backends targeted by a `BackendTLSPolicy`.
+It applies to the `HTTPRoute`, `GRPCRoute`, and `TLSRoute` resources attached to the `Gateway`, including through its `ListenerSet` resources.
+
+The `clientCertificateRef` must reference a `Secret` containing the `tls.crt` and `tls.key` entries.
+Referencing a `Secret` in another namespace requires a `ReferenceGrant`.
+When the certificate cannot be loaded, the `Gateway` `ResolvedRefs` condition is set to `False`, and Traefik connects to the backends without a client certificate.
+
+```yaml
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: default
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: web
+      protocol: HTTP
+      port: 80
+  tls:
+    backend:
+      clientCertificateRef:
+        name: client-cert
+```
+
 ## Exposing a Route
 
 Once a `Gateway` is deployed (see [Deploying a Gateway](#deploying-a-gateway)) `HTTPRoute`, `TCPRoute`, 

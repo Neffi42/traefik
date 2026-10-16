@@ -12386,35 +12386,54 @@ func Test_makeGatewayStatus(t *testing.T) {
 			}},
 		}}
 	}
+	unresolvedListener := func() gatewayListener {
+		return gatewayListener{Status: &gatev1.ListenerStatus{
+			Name: "unresolved",
+			Conditions: []metav1.Condition{{
+				Type:   string(gatev1.ListenerConditionResolvedRefs),
+				Status: metav1.ConditionFalse,
+				Reason: string(gatev1.ListenerReasonInvalidCertificateRef),
+			}},
+		}}
+	}
 
 	testCases := []struct {
-		desc           string
-		infrastructure *gatev1.GatewayInfrastructure
-		listeners      []gatewayListener
-		wantStatus     metav1.ConditionStatus
-		wantReason     gatev1.GatewayConditionReason
-		wantProgrammed metav1.ConditionStatus
+		desc                       string
+		infrastructure             *gatev1.GatewayInfrastructure
+		listeners                  []gatewayListener
+		backendClientCertCondition *metav1.Condition
+		wantStatus                 metav1.ConditionStatus
+		wantReason                 gatev1.GatewayConditionReason
+		wantProgrammed             metav1.ConditionStatus
+		wantResolvedRefs           metav1.ConditionStatus
+		wantResolvedRefsReason     gatev1.GatewayConditionReason
 	}{
 		{
-			desc:           "all listeners valid",
-			listeners:      []gatewayListener{acceptedListener()},
-			wantStatus:     metav1.ConditionTrue,
-			wantReason:     gatev1.GatewayReasonAccepted,
-			wantProgrammed: metav1.ConditionTrue,
+			desc:                   "all listeners valid",
+			listeners:              []gatewayListener{acceptedListener()},
+			wantStatus:             metav1.ConditionTrue,
+			wantReason:             gatev1.GatewayReasonAccepted,
+			wantProgrammed:         metav1.ConditionTrue,
+			wantResolvedRefs:       metav1.ConditionTrue,
+			wantResolvedRefsReason: gatev1.GatewayReasonResolvedRefs,
 		},
 		{
-			desc:           "one listener valid among invalid ones",
-			listeners:      []gatewayListener{acceptedListener(), invalidListener()},
-			wantStatus:     metav1.ConditionTrue,
-			wantReason:     gatev1.GatewayReasonListenersNotValid,
-			wantProgrammed: metav1.ConditionTrue,
+			desc:                   "one listener valid among invalid ones",
+			listeners:              []gatewayListener{acceptedListener(), invalidListener()},
+			wantStatus:             metav1.ConditionTrue,
+			wantReason:             gatev1.GatewayReasonListenersNotValid,
+			wantProgrammed:         metav1.ConditionTrue,
+			wantResolvedRefs:       metav1.ConditionTrue,
+			wantResolvedRefsReason: gatev1.GatewayReasonResolvedRefs,
 		},
 		{
-			desc:           "no listener valid",
-			listeners:      []gatewayListener{invalidListener()},
-			wantStatus:     metav1.ConditionFalse,
-			wantReason:     gatev1.GatewayReasonListenersNotValid,
-			wantProgrammed: metav1.ConditionFalse,
+			desc:                   "no listener valid",
+			listeners:              []gatewayListener{invalidListener()},
+			wantStatus:             metav1.ConditionFalse,
+			wantReason:             gatev1.GatewayReasonListenersNotValid,
+			wantProgrammed:         metav1.ConditionFalse,
+			wantResolvedRefs:       metav1.ConditionTrue,
+			wantResolvedRefsReason: gatev1.GatewayReasonResolvedRefs,
 		},
 		{
 			desc:      "infrastructure parametersRef",
@@ -12426,8 +12445,33 @@ func Test_makeGatewayStatus(t *testing.T) {
 					Name:  "invalid",
 				},
 			},
-			wantStatus: metav1.ConditionFalse,
-			wantReason: gatev1.GatewayReasonInvalidParameters,
+			wantStatus:             metav1.ConditionFalse,
+			wantReason:             gatev1.GatewayReasonInvalidParameters,
+			wantResolvedRefs:       metav1.ConditionTrue,
+			wantResolvedRefsReason: gatev1.GatewayReasonResolvedRefs,
+		},
+		{
+			desc:                   "listener with unresolved references",
+			listeners:              []gatewayListener{acceptedListener(), unresolvedListener()},
+			wantStatus:             metav1.ConditionTrue,
+			wantReason:             gatev1.GatewayReasonListenersNotValid,
+			wantProgrammed:         metav1.ConditionTrue,
+			wantResolvedRefs:       metav1.ConditionFalse,
+			wantResolvedRefsReason: gatev1.GatewayReasonListenersNotResolved,
+		},
+		{
+			desc:      "invalid backend client certificate",
+			listeners: []gatewayListener{acceptedListener()},
+			backendClientCertCondition: &metav1.Condition{
+				Type:   string(gatev1.GatewayConditionResolvedRefs),
+				Status: metav1.ConditionFalse,
+				Reason: string(gatev1.GatewayReasonInvalidClientCertificateRef),
+			},
+			wantStatus:             metav1.ConditionTrue,
+			wantReason:             gatev1.GatewayReasonAccepted,
+			wantProgrammed:         metav1.ConditionTrue,
+			wantResolvedRefs:       metav1.ConditionFalse,
+			wantResolvedRefsReason: gatev1.GatewayReasonInvalidClientCertificateRef,
 		},
 	}
 
@@ -12438,7 +12482,7 @@ func Test_makeGatewayStatus(t *testing.T) {
 			p := Provider{}
 			gateway := &gatev1.Gateway{Spec: gatev1.GatewaySpec{Infrastructure: test.infrastructure}}
 
-			status, _ := p.makeGatewayStatus(gateway, test.listeners, nil, slices.ContainsFunc(test.listeners, func(listener gatewayListener) bool {
+			status, _ := p.makeGatewayStatus(gateway, test.listeners, test.backendClientCertCondition, nil, slices.ContainsFunc(test.listeners, func(listener gatewayListener) bool {
 				return len(listener.Status.Conditions) == 0
 			}))
 
@@ -12447,6 +12491,11 @@ func Test_makeGatewayStatus(t *testing.T) {
 			assert.Equal(t, test.wantStatus, condition.Status)
 			assert.Equal(t, string(test.wantReason), condition.Reason)
 			assert.Len(t, status.Listeners, len(test.listeners))
+
+			resolvedRefs := meta.FindStatusCondition(status.Conditions, string(gatev1.GatewayConditionResolvedRefs))
+			require.NotNil(t, resolvedRefs)
+			assert.Equal(t, test.wantResolvedRefs, resolvedRefs.Status)
+			assert.Equal(t, string(test.wantResolvedRefsReason), resolvedRefs.Reason)
 
 			programmed := meta.FindStatusCondition(status.Conditions, string(gatev1.GatewayConditionProgrammed))
 			if test.wantProgrammed == "" {
@@ -12826,6 +12875,194 @@ func Test_loadConfigurationFromGateways_BackendTLSPolicyAncestorNamespace(t *tes
 				Name:        "my-gateway",
 				SectionName: new(test.sectionName),
 			}, policy.Status.Ancestors[0].AncestorRef)
+		})
+	}
+}
+
+func Test_loadConfigurationFromGateways_BackendClientCertificate(t *testing.T) {
+	testCases := []struct {
+		desc        string
+		path        string
+		entryPoints map[string]Entrypoint
+	}{
+		{
+			desc:        "HTTPRoute",
+			path:        "httproute/with_backend_tls_policy_client_certificate.yml",
+			entryPoints: map[string]Entrypoint{"web": {Address: ":80"}},
+		},
+		{
+			desc:        "GRPCRoute",
+			path:        "grpcroute/with_backend_tls_policy_client_certificate.yml",
+			entryPoints: map[string]Entrypoint{"web": {Address: ":80"}},
+		},
+		{
+			desc:        "TLSRoute",
+			path:        "tlsroute/with_backend_tls_policy_client_certificate.yml",
+			entryPoints: map[string]Entrypoint{"tls": {Address: ":9001"}},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			k8sObjects, gwObjects := readResources(t, []string{"services.yml", test.path})
+
+			gwClient := newGatewaySimpleClientSet(t, gwObjects...)
+			client := newClientImpl(kubefake.NewClientset(k8sObjects...), gwClient)
+
+			eventCh, err := client.WatchAll(nil, make(chan struct{}))
+			require.NoError(t, err)
+
+			// just wait for the first event
+			<-eventCh
+
+			p := Provider{
+				EntryPoints: test.entryPoints,
+				client:      client,
+			}
+
+			conf, statusReport, err := p.loadConfigurationFromGateways(t.Context())
+			require.NoError(t, err)
+
+			wantCertificates := tls.Certificates{{
+				CertFile: types.FileOrContent(listenerCert),
+				KeyFile:  types.FileOrContent(listenerKey),
+			}}
+
+			var certificates []tls.Certificates
+			for _, st := range conf.HTTP.ServersTransports {
+				certificates = append(certificates, st.Certificates)
+			}
+			for _, st := range conf.TCP.ServersTransports {
+				certificates = append(certificates, st.TLS.Certificates)
+			}
+			assert.Equal(t, []tls.Certificates{wantCertificates}, certificates)
+
+			statusReport.Flush(t.Context(), client)
+
+			gateway, err := gwClient.GatewayV1().Gateways("default").Get(t.Context(), "my-gateway", metav1.GetOptions{})
+			require.NoError(t, err)
+
+			resolvedRefs := meta.FindStatusCondition(gateway.Status.Conditions, string(gatev1.GatewayConditionResolvedRefs))
+			require.NotNil(t, resolvedRefs)
+			assert.Equal(t, metav1.ConditionTrue, resolvedRefs.Status)
+		})
+	}
+}
+
+func Test_loadBackendClientCertificate(t *testing.T) {
+	testCases := []struct {
+		desc       string
+		backend    *gatev1.GatewayBackendTLS
+		wantCert   bool
+		wantReason gatev1.GatewayConditionReason
+	}{
+		{
+			desc: "no backend TLS configuration",
+		},
+		{
+			desc:    "no client certificate",
+			backend: &gatev1.GatewayBackendTLS{},
+		},
+		{
+			desc: "Secret in the Gateway namespace",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Name: "client-cert",
+			}},
+			wantCert: true,
+		},
+		{
+			desc: "Secret with the core group",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Group: new(gatev1.Group(groupCore)),
+				Kind:  new(gatev1.Kind(kindSecret)),
+				Name:  "client-cert",
+			}},
+			wantCert: true,
+		},
+		{
+			desc: "cross-namespace Secret allowed by a ReferenceGrant",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Namespace: new(gatev1.Namespace("bar")),
+				Name:      "client-cert",
+			}},
+			wantCert: true,
+		},
+		{
+			desc: "cross-namespace Secret without ReferenceGrant",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Namespace: new(gatev1.Namespace("baz")),
+				Name:      "client-cert",
+			}},
+			wantReason: gatev1.GatewayReasonRefNotPermitted,
+		},
+		{
+			desc: "unsupported kind",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Kind: new(gatev1.Kind(kindConfigMap)),
+				Name: "client-cert",
+			}},
+			wantReason: gatev1.GatewayReasonInvalidClientCertificateRef,
+		},
+		{
+			desc: "missing Secret",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Name: "missing",
+			}},
+			wantReason: gatev1.GatewayReasonInvalidClientCertificateRef,
+		},
+		{
+			desc: "Secret without private key",
+			backend: &gatev1.GatewayBackendTLS{ClientCertificateRef: &gatev1.SecretObjectReference{
+				Name: "client-cert-without-key",
+			}},
+			wantReason: gatev1.GatewayReasonInvalidClientCertificateRef,
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.desc, func(t *testing.T) {
+			t.Parallel()
+
+			k8sObjects, gwObjects := readResources(t, []string{"referencegrant/for_backend_client_certificate.yml"})
+
+			client := newClientImpl(kubefake.NewClientset(k8sObjects...), newGatewaySimpleClientSet(t, gwObjects...))
+
+			eventCh, err := client.WatchAll(nil, make(chan struct{}))
+			require.NoError(t, err)
+
+			// just wait for the first event
+			<-eventCh
+
+			p := Provider{client: client}
+
+			gateway := &gatev1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "my-gateway", Namespace: "default"}}
+			if test.backend != nil {
+				gateway.Spec.TLS = &gatev1.GatewayTLSConfig{Backend: test.backend}
+			}
+
+			cert, condition := p.loadBackendClientCertificate(gateway)
+
+			if test.wantReason != "" {
+				assert.Nil(t, cert)
+				require.NotNil(t, condition)
+				assert.Equal(t, string(gatev1.GatewayConditionResolvedRefs), condition.Type)
+				assert.Equal(t, metav1.ConditionFalse, condition.Status)
+				assert.Equal(t, string(test.wantReason), condition.Reason)
+				return
+			}
+
+			assert.Nil(t, condition)
+			if !test.wantCert {
+				assert.Nil(t, cert)
+				return
+			}
+
+			assert.Equal(t, &tls.Certificate{
+				CertFile: types.FileOrContent(listenerCert),
+				KeyFile:  types.FileOrContent(listenerKey),
+			}, cert)
 		})
 	}
 }
